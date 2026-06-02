@@ -1,0 +1,47 @@
+# hac-da-rippr Configuration File
+# Located at: /etc/auto_handbrake.conf
+
+# DVD device to monitor (e.g., /dev/sr0, /dev/sr1)
+DVD_DEVICE="/dev/sr0"
+
+# Target directory for ripped videos
+TARGETPATH="/home/nowhereman/Videos"
+
+# Minimum title duration (in seconds) - skip shorter titles
+# Default: 3600 (1 hour)
+MINDURATION="3600"
+
+# Video encoding quality (CRF - Constant Rate Factor)
+# 18  = visually lossless (larger file)
+# 23  = default / recommended
+# 28  = lower quality (smaller file)
+VIDEO_QUALITY="18"
+
+# Video encoder
+# x264   = H.264 (best compatibility)
+# x265   = H.265 (better compression, less compatible)
+VIDEO_ENCODER="x264"
+
+# Encoder preset (x264/x265 speed/quality tradeoff)
+# ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+ENCODER_PRESET="slow"
+
+# Audio encoder
+# copy:ac3,aac  = passthrough AC3, fallback to AAC
+# aac           = always encode to AAC
+# opus          = Opus codec
+AUDIO_ENCODER="copy:ac3,aac"
+
+# Preferred audio language (ISO 639-2 code)
+# eng = English
+# fra = French
+# deu = German
+# spa = Spanish
+DEFAULT_AUDIO="eng"
+
+# DVD polling interval (seconds)
+# How often to check for a new DVD
+POLL_INTERVAL=30
+
+# Maximum retries for DVD title detection
+MAX_RETRIES=3
