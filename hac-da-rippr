@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+
+# hac-da-rippr
+# Auto DVD ripper with multi-feature disc support
+# Enhanced with better error handling, logging, and security
+
+set -euo pipefail  # Exit on error, undefined vars, pipe failures
+
+# Configuration
+CONFIG_FILE="/etc/auto_handbrake.conf"
+LOG_DIR="/home/nowhereman/.log/auto_handbrake"
+LOG_FILE="${LOG_DIR}/auto_handbrake.log"
+RIPPED_LOG="${LOG_DIR}/ripped_dvds.log"
+TARGETPATH="/home/nowhereman/Videos"
+MINDURATION="3600"
+DVD_DEVICE="/dev/sr0"
+POLL_INTERVAL=30
+MAX_RETRIES=3
+LOCKFILE="/tmp/auto_handbrake.pid"
+
+# Default HandBrake settings
+# In your config block, detect NTSC vs PAL from the disc:
+DVD_STANDARD="NTSC"   # or "PAL" — or detect automatically (see below)
+
+# Replace DEFAULT_PRESET with these:
+VIDEO_QUALITY="18"          # CRF — lower = better quality, larger file (18 is visually lossless)
+VIDEO_ENCODER="x264"
+ENCODER_PRESET="slow"       # x264 speed preset (not HandBrake preset)
+AUDIO_ENCODER="copy:ac3,aac"  # passthrough AC3, fallback to AAC
+DEFAULT_AUDIO="eng"
+
+# Load configuration if available
+if [[ -r "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# Find HandBrake CLI
+HANDBRAKECLI=$(command -v HandBrakeCLI || true)
+if [[ -z "$HANDBRAKECLI" ]]; then
+    echo "Error: HandBrakeCLI not found. Please install HandBrake." >&2
+    exit 1
+fi
+
+# Logging function with rotation
+log() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Create log directory if it doesn't exist
+    mkdir -p "$LOG_DIR"
+
+    # Rotate log if it gets too large (>10MB)
+    if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 10485760 ]]; then
+        mv "$LOG_FILE" "${LOG_FILE}.old"
+    fi
+
+    printf "[%s] [%s] %s\n" "$timestamp" "$level" "$message" | tee -a "$LOG_FILE"
+}
+
+# Enhanced notification function
+notify_user() {
+    local message="$1"
+    log "INFO" "$message"
+
+    # Desktop notification
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send "Auto HandBrake" "$message" -t 5000 2>/dev/null || true
+    fi
+
+    # System logger
+    if command -v logger >/dev/null 2>&1; then
+        logger -t "auto_handbrake" "$message" 2>/dev/null || true
+    fi
+}
+
+# Check if DVD is present and readable
+check_dvd_present() {
+    if [[ ! -e "$DVD_DEVICE" ]]; then
+        return 1
+    fi
+
+    # Try to read the device
+    if ! dd if="$DVD_DEVICE" bs=1 count=1 of=/dev/null 2>/dev/null; then
+        return 1
+    fi
+
+    return 0
+}
+
+get_dvd_standard() {
+    local height
+    height=$("$HANDBRAKECLI" --input "$DVD_DEVICE" --title 0 2>&1 \
+        | grep -oP '\d+x\d+' | head -1 | cut -d'x' -f2)
+    if [[ "$height" == "576" ]]; then
+        echo "PAL"
+    else
+        echo "NTSC"
+    fi
+}
+
+# Get DVD title with better error handling
+get_dvd_title() {
+    local title
+    local retries=0
+
+    while [[ $retries -lt $MAX_RETRIES ]]; do
+        if title=$(isoinfo -d -i "$DVD_DEVICE" 2>/dev/null | grep "Volume id" | cut -c12- | tr -d '\r\n' | sed 's/[^a-zA-Z0-9._-]/_/g'); then
+            if [[ -n "$title" && "$title" != "_" ]]; then
+                echo "$title"
+                return 0
+            fi
+        fi
+
+        ((retries++))
+        log "WARN" "Failed to get DVD title, retry $retries/$MAX_RETRIES"
+        sleep 5
+    done
+
+    # Fallback title
+    echo "Unknown_DVD_$(date +%Y%m%d_%H%M%S)"
+    return 1
+}
+
+# Check if DVD was already ripped
+is_dvd_already_ripped() {
+    local title="$1"
+
+    [[ -f "$RIPPED_LOG" ]] && grep -Fxq "$title" "$RIPPED_LOG"
+}
+
+# Add DVD to ripped list
+mark_dvd_as_ripped() {
+    local title="$1"
+    mkdir -p "$LOG_DIR"
+    echo "$title" >> "$RIPPED_LOG"
+}
+
+# Scan disc and return all title numbers and durations above MINDURATION
+# Uses a single HandBrakeCLI scan pass for speed
+get_long_titles() {
+    "$HANDBRAKECLI" --input "$DVD_DEVICE" --title 0 2>&1 | \
+    awk -v min="$MINDURATION" '
+        /^\s*\+ title [0-9]+/ {
+            title = $0
+            gsub(/.*title /, "", title)
+            gsub(/:.*/, "", title)
+        }
+        /duration:/ {
+            split($3, t, ":")
+            secs = t[1]*3600 + t[2]*60 + t[3]
+            if (secs >= min) print title, secs
+        }
+    '
+}
+
+# Rip a single title by number to the given output file
+rip_title() {
+    local title_num="$1"
+    local output_file="$2"
+    local standard="${3:-NTSC}"
+
+    local width=720
+    local height=480
+    [[ "$standard" == "PAL" ]] && height=576
+
+    "$HANDBRAKECLI" \
+        --input "$DVD_DEVICE" \
+        --output "$output_file" \
+        --title "$title_num" \
+        --encoder "$VIDEO_ENCODER" \
+        --encoder-preset "$ENCODER_PRESET" \
+        --quality "$VIDEO_QUALITY" \
+        --width "$width" \
+        --height "$height" \
+        --comb-detect \
+        --decomb \
+        --detelecine \
+        --aencoder "$AUDIO_ENCODER" \
+        --mixdown "5point1" \
+        --audio-lang-list "${DEFAULT_AUDIO}" \
+        --subtitle-lang-list "${DEFAULT_AUDIO}" \
+        --verbose=1 \
+        2>&1 | tee -a "$LOG_FILE"
+}
+
+# Format seconds as HH:MM:SS
+format_duration() {
+    local total_seconds="$1"
+    local h m s
+    h=$(( total_seconds / 3600 ))
+    m=$(( (total_seconds % 3600) / 60 ))
+    s=$(( total_seconds % 60 ))
+    printf "%02d:%02d:%02d" "$h" "$m" "$s"
+}
+
+# Main DVD ripping function with multi-feature support
+rip_dvd() {
+    local dvd_title
+
+    log "INFO" "Checking for DVD..."
+
+    if ! check_dvd_present; then
+        return 0
+    fi
+
+    sleep 10  # Allow DVD to fully mount
+
+    # Get DVD title
+    if ! dvd_title=$(get_dvd_title); then
+        log "ERROR" "Could not determine DVD title"
+        notify_user "Error: Could not read DVD title"
+        return 1
+    fi
+
+    log "INFO" "DVD detected: $dvd_title"
+
+    local dvd_standard
+    dvd_standard=$(get_dvd_standard)
+    log "INFO" "Disc standard: $dvd_standard"
+
+    # Check if already ripped
+    if is_dvd_already_ripped "$dvd_title"; then
+        log "INFO" "DVD '$dvd_title' already ripped, ejecting"
+        notify_user "DVD '$dvd_title' already ripped. Ejecting..."
+        eject "$DVD_DEVICE" 2>/dev/null || true
+        return 0
+    fi
+
+    # Validate target directory
+    if [[ ! -d "$TARGETPATH" ]]; then
+        log "ERROR" "Target directory does not exist: $TARGETPATH"
+        notify_user "Error: Target directory missing"
+        return 1
+    fi
+
+    if [[ ! -w "$TARGETPATH" ]]; then
+        log "ERROR" "Target directory is not writable: $TARGETPATH"
+        notify_user "Error: Target directory not writable"
+        return 1
+    fi
+
+    # Scan disc for all qualifying titles
+    log "INFO" "Scanning disc for titles over ${MINDURATION}s..."
+    notify_user "Scanning disc: $dvd_title"
+
+    mapfile -t titles < <(get_long_titles)
+
+    if [[ ${#titles[@]} -eq 0 ]]; then
+        log "ERROR" "No titles found over minimum duration (${MINDURATION}s)"
+        notify_user "No qualifying titles found on disc"
+        return 1
+    fi
+
+    log "INFO" "Found ${#titles[@]} qualifying title(s) on disc '$dvd_title'"
+
+    # Declare outside both branches so set -u doesn't fire
+    local title_num total_seconds duration_fmt output_file movie_name
+    local rip_start rip_end duration_taken
+
+    if [[ ${#titles[@]} -eq 1 ]]; then
+        title_num=$(echo "${titles[0]}" | cut -d' ' -f1)
+        total_seconds=$(echo "${titles[0]}" | cut -d' ' -f2)
+        duration_fmt=$(format_duration "$total_seconds")
+        output_file="${TARGETPATH}/${dvd_title}.mp4"
+
+        log "INFO" "Single title disc. Ripping title $title_num as '$dvd_title' ($duration_fmt)"
+        notify_user "Ripping: $dvd_title ($duration_fmt)"
+
+        rip_start=$(date +%s)
+        if rip_title "$title_num" "$output_file" "$dvd_standard"; then
+            rip_end=$(date +%s)
+            duration_taken=$((rip_end - rip_start))
+            log "INFO" "Ripped '$dvd_title' successfully (${duration_taken}s)"
+            notify_user "Done: $dvd_title"
+            mark_dvd_as_ripped "$dvd_title"
+        else
+            log "ERROR" "Failed to rip '$dvd_title'"
+            notify_user "Failed: $dvd_title"
+            [[ -f "$output_file" ]] && rm -f "$output_file"
+            eject "$DVD_DEVICE" 2>/dev/null || true
+            return 1
+        fi
+
+    else
+        log "INFO" "Multi-feature disc: ${#titles[@]} titles found on '$dvd_title'"
+        notify_user "Multi-feature disc: $dvd_title (${#titles[@]} titles)"
+
+        local all_success=true
+        local ripped_count=0
+
+        for title_entry in "${titles[@]}"; do
+            title_num=$(echo "$title_entry" | cut -d' ' -f1)
+            total_seconds=$(echo "$title_entry" | cut -d' ' -f2)
+            duration_fmt=$(format_duration "$total_seconds")
+            movie_name="${dvd_title}_title${title_num}"
+            output_file="${TARGETPATH}/${movie_name}.mp4"
+
+            log "INFO" "Ripping title $title_num as '$movie_name' ($duration_fmt)"
+            notify_user "Ripping: $movie_name ($duration_fmt)"
+
+            rip_start=$(date +%s)
+            if rip_title "$title_num" "$output_file" "$dvd_standard"; then
+                rip_end=$(date +%s)
+                duration_taken=$((rip_end - rip_start))
+                log "INFO" "Ripped '$movie_name' successfully (${duration_taken}s)"
+                notify_user "Done: $movie_name"
+                ripped_count=$((ripped_count + 1))
+            else
+                log "ERROR" "Failed to rip title $title_num ('$movie_name')"
+                notify_user "Failed: $movie_name"
+                [[ -f "$output_file" ]] && rm -f "$output_file"
+                all_success=false
+            fi
+        done
+    fi
+
+    eject "$DVD_DEVICE" 2>/dev/null || true
+    return 0
+}
+
+# Cleanup function
+cleanup() {
+    log "INFO" "Shutting down auto-rip daemon"
+    [[ -f "$LOCKFILE" ]] && rm -f "$LOCKFILE"
+    exit 0
+}
+
+# Signal handlers
+trap cleanup TERM INT
+
+# Check if already running
+if [[ -f "$LOCKFILE" ]] && kill -0 "$(cat "$LOCKFILE")" 2>/dev/null; then
+    echo "Auto-rip daemon is already running (PID: $(cat "$LOCKFILE"))" >&2
+    exit 1
+fi
+
+# Create lockfile
+echo $$ > "$LOCKFILE"
+
+# Check permissions (but don't require root)
+if [[ $EUID -eq 0 ]]; then
+    log "WARN" "Running as root. Consider running as a regular user with proper group permissions."
+fi
+
+# Verify DVD device exists (warn but don't exit — device may appear later)
+if [[ ! -e "$DVD_DEVICE" ]]; then
+    log "WARN" "DVD device not found: $DVD_DEVICE — will retry each poll cycle"
+fi
+
+log "INFO" "Hack the Ripper has started (PID: $$)"
+log "INFO" "Target directory: $TARGETPATH"
+log "INFO" "DVD device: $DVD_DEVICE"
+log "INFO" "Minimum title duration: $(format_duration "$MINDURATION")"
+notify_user "Hack the Ripper has started"
+
+# Main loop
+while true; do
+    if ! rip_dvd; then
+        log "WARN" "Rip operation failed, continuing..."
+    fi
+
+    sleep "$POLL_INTERVAL"
+done
